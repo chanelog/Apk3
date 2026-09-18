@@ -1,0 +1,6 @@
+{
+  "name": "HN Tunnel",
+  "description": "Aplikasi tunnel responsif & ringan untuk SSH, V2Ray, dan SSL dengan payload generator, impor/ekspor konfigurasi, dan logs live.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
