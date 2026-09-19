@@ -19,6 +19,14 @@ object XrayConfigBuilder {
     val root = JSONObject()
     root.put("log", JSONObject().apply { put("loglevel", "warning") })
 
+    // WAJIB: tanpa ini, Xray sering "connected" tapi nggak bisa resolve domain
+    // sama sekali (gejala persis "connect tapi internet nggak jalan").
+    val dnsServer1 = config.customDns1.ifBlank { "8.8.8.8" }
+    val dnsServer2 = config.customDns2.ifBlank { "1.1.1.1" }
+    root.put("dns", JSONObject().apply {
+      put("servers", JSONArray().put(dnsServer1).put(dnsServer2))
+    })
+
     root.put("inbounds", JSONArray().put(
       JSONObject().apply {
         put("tag", "socks-in")
@@ -41,6 +49,20 @@ object XrayConfigBuilder {
     root.put("outbounds", JSONArray().put(outbound).put(
       JSONObject().apply { put("protocol", "freedom"); put("tag", "direct") }
     ))
+
+    // Rute eksplisit: semua trafik lewat "proxy" secara default. Tanpa blok
+    // ini Xray SEHARUSNYA tetap pakai outbound pertama secara default, tapi
+    // ditulis eksplisit supaya tidak ambigu.
+    root.put("routing", JSONObject().apply {
+      put("domainStrategy", "IPIfNonMatch")
+      put("rules", JSONArray().put(
+        JSONObject().apply {
+          put("type", "field")
+          put("network", "tcp,udp")
+          put("outboundTag", "proxy")
+        }
+      ))
+    })
 
     return root.toString()
   }
