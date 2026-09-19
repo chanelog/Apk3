@@ -164,7 +164,7 @@ class HnTunnelVpnService : VpnService() {
     LogManager.i("Menyiapkan Xray-core (${config.type.displayName})...")
     TunnelController.updateState(TunnelState.AUTHENTICATING)
     val json = com.example.tunnel.XrayConfigBuilder.build(config, LOCAL_SOCKS_PORT)
-    com.example.tunnel.XrayCoreBridge.start(json) { fd -> protect(fd) }
+    com.example.tunnel.XrayCoreBridge.start(json, assetsPath = filesDir.absolutePath)
     LogManager.s("Xray-core tersambung, SOCKS5 lokal dibuka di 127.0.0.1:$LOCAL_SOCKS_PORT")
   }
 
