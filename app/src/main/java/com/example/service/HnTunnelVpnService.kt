@@ -84,14 +84,8 @@ class HnTunnelVpnService : VpnService() {
         LogManager.i("Tunnel Mode: ${config.type.displayName}")
         LogManager.i("Profile: ${config.name}")
 
-        TunnelController.updateState(TunnelState.HANDSHAKING)
-        when (config.type) {
-          TunnelType.SSH_DIRECT, TunnelType.SSH_SSL_TLS, TunnelType.SSH_HTTP_PROXY ->
-            connectSshBackend(config)
-          TunnelType.V2RAY_VMESS, TunnelType.V2RAY_VLESS, TunnelType.TROJAN ->
-            connectXrayBackend(config)
-        }
-
+        // 1. Buka TUN interface dulu (dibutuhkan lebih awal karena Xray-core
+        //    versi baru butuh tunFd langsung, bukan lewat tun2socks terpisah).
         LogManager.d("Allocating virtual network interface (TUN)...")
         val builder = Builder()
           .setMtu(1500)
@@ -124,18 +118,32 @@ class HnTunnelVpnService : VpnService() {
         vpnInterface = pfd
         LogManager.s("Virtual interface tun0 established (MTU 1500).")
 
-        val started = HevSocks5Bridge.start(
-          context = this@HnTunnelVpnService,
-          socksPort = LOCAL_SOCKS_PORT,
-          enableUdp = config.enableUdp,
-          tunFd = pfd.fd
-        )
-        if (!started) {
-          LogManager.e("tun2socks gagal start. Cek logcat filter TProxyService/hev-socks5-tunnel.")
-          stopTunnel()
-          return@launch
+        // 2. Sambungkan backend sesuai jenis tunnel.
+        TunnelController.updateState(TunnelState.HANDSHAKING)
+        when (config.type) {
+          TunnelType.SSH_DIRECT, TunnelType.SSH_SSL_TLS, TunnelType.SSH_HTTP_PROXY -> {
+            // SSH tidak punya tun2socks bawaan -> connect SSH dulu, baru
+            // jembatani TUN fd ke SOCKS5 lokal SSH lewat HevSocks5Bridge.
+            connectSshBackend(config)
+            val started = HevSocks5Bridge.start(
+              context = this@HnTunnelVpnService,
+              socksPort = LOCAL_SOCKS_PORT,
+              enableUdp = config.enableUdp,
+              tunFd = pfd.fd
+            )
+            if (!started) {
+              LogManager.e("tun2socks gagal start. Cek logcat filter TProxyService/hev-socks5-tunnel.")
+              stopTunnel()
+              return@launch
+            }
+            LogManager.s("tun2socks aktif, trafik TUN diarahkan ke SOCKS5 127.0.0.1:$LOCAL_SOCKS_PORT")
+          }
+          TunnelType.V2RAY_VMESS, TunnelType.V2RAY_VLESS, TunnelType.TROJAN -> {
+            // Xray-core versi ini pegang TUN fd LANGSUNG (tun2socks bawaan),
+            // jadi HevSocks5Bridge tidak dipakai untuk jalur ini.
+            connectXrayBackend(config, tunFd = pfd.fd)
+          }
         }
-        LogManager.s("tun2socks aktif, trafik TUN diarahkan ke SOCKS5 127.0.0.1:$LOCAL_SOCKS_PORT")
 
         TunnelController.updateState(TunnelState.CONNECTED)
         LogManager.s("Tunnel successfully connected! Internet data bridge is ACTIVE.")
@@ -160,12 +168,12 @@ class HnTunnelVpnService : VpnService() {
     LogManager.s("SSH tersambung, SOCKS5 lokal dibuka di 127.0.0.1:$LOCAL_SOCKS_PORT")
   }
 
-  private suspend fun connectXrayBackend(config: TunnelConfig) = withContext(Dispatchers.IO) {
+  private suspend fun connectXrayBackend(config: TunnelConfig, tunFd: Int) = withContext(Dispatchers.IO) {
     LogManager.i("Menyiapkan Xray-core (${config.type.displayName})...")
     TunnelController.updateState(TunnelState.AUTHENTICATING)
     val json = com.example.tunnel.XrayConfigBuilder.build(config, LOCAL_SOCKS_PORT)
-    com.example.tunnel.XrayCoreBridge.start(json, assetsPath = filesDir.absolutePath)
-    LogManager.s("Xray-core tersambung, SOCKS5 lokal dibuka di 127.0.0.1:$LOCAL_SOCKS_PORT")
+    com.example.tunnel.XrayCoreBridge.start(json, tunFd = tunFd, assetsPath = filesDir.absolutePath)
+    LogManager.s("Xray-core tersambung, tun2socks bawaan Xray aktif di tunFd=$tunFd")
   }
 
   private fun startStatsMonitor(config: TunnelConfig) {
@@ -178,6 +186,7 @@ class HnTunnelVpnService : VpnService() {
         delay(1000)
         seconds++
 
+        // [txPackets, txBytes, rxPackets, rxBytes] — lihat TProxyGetStats() di README resmi
         val raw = HevSocks5Bridge.stats()
         val txBytes = raw?.getOrNull(1) ?: lastTxBytes
         val rxBytes = raw?.getOrNull(3) ?: lastRxBytes
