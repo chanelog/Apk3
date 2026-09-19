@@ -22,28 +22,32 @@ jobs:
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v4
 
-    # --- Step baru: ambil tun2socks + Xray-core siap pakai, tanpa NDK/Go ---
-    - name: Download prebuilt hev-socks5-tunnel.aar
-      run: |
-        mkdir -p app/libs
-        AAR_URL=$(curl -s https://api.github.com/repos/heiher/hev-socks5-tunnel/releases/latest \
-          | grep -o '"browser_download_url": *"[^"]*\.aar"' \
-          | sed -E 's/.*"(https:[^"]+)"/\1/' | head -n1)
-        echo "URL asset .aar ditemukan: $AAR_URL"
-        if [ -z "$AAR_URL" ]; then
-          echo "::error::Tidak ada file .aar di rilis terbaru hev-socks5-tunnel — cek manual di https://github.com/heiher/hev-socks5-tunnel/releases"
-          exit 1
-        fi
-        curl -L -o app/libs/hev-socks5-tunnel.aar "$AAR_URL"
-        SIZE=$(stat -c%s app/libs/hev-socks5-tunnel.aar)
-        echo "Ukuran file hasil download: $SIZE bytes"
-        if [ "$SIZE" -lt 10000 ]; then
-          echo "::error::File .aar yang terdownload terlalu kecil ($SIZE bytes) — kemungkinan bukan file .aar asli. Isi file:"
-          cat app/libs/hev-socks5-tunnel.aar
-          exit 1
-        fi
-        ls -la app/libs/
+    # --- Step baru: compile tun2socks (hev-socks5-tunnel) via NDK ---
+    # (Tidak ada file .aar siap pakai untuk library ini, jadi kita compile
+    # sendiri dari source-nya via ndk-build, sesuai instruksi resmi mereka)
+    - name: Set up Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r27c
 
+    - name: Clone & build hev-socks5-tunnel (tun2socks)
+      run: |
+        mkdir -p hev-build
+        cd hev-build
+        git clone --recursive https://github.com/heiher/hev-socks5-tunnel jni
+        "${{ steps.setup-ndk.outputs.ndk-path }}/ndk-build" -j$(nproc)
+        echo "--- hasil build ---"
+        find libs -type f
+
+    - name: Salin .so hasil build ke app/src/main/jniLibs
+      run: |
+        mkdir -p app/src/main/jniLibs
+        cp -r hev-build/libs/* app/src/main/jniLibs/
+        find app/src/main/jniLibs -type f
+    # --- akhir step tun2socks ---
+
+    # --- Xray-core: ini TERBUKTI sukses download sebelumnya, tidak diubah ---
     - name: Download prebuilt libv2ray.aar (Xray-core)
       run: |
         mkdir -p app/libs
@@ -52,12 +56,11 @@ jobs:
         SIZE=$(stat -c%s app/libs/libv2ray.aar)
         echo "Ukuran file hasil download: $SIZE bytes"
         if [ "$SIZE" -lt 10000 ]; then
-          echo "::error::libv2ray.aar yang terdownload terlalu kecil ($SIZE bytes) — kemungkinan bukan file .aar asli. Isi file:"
+          echo "::error::libv2ray.aar yang terdownload terlalu kecil ($SIZE bytes)"
           cat app/libs/libv2ray.aar
           exit 1
         fi
         ls -la app/libs/
-    # --- akhir step baru ---
 
     - name: Generate Debug Keystore
       run: |
