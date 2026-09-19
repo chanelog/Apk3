@@ -62,6 +62,29 @@ jobs:
         fi
         ls -la app/libs/
 
+    - name: Inspect libv2ray.aar contents
+      run: |
+        mkdir -p /tmp/aar-inspect
+        cd /tmp/aar-inspect
+        unzip -o -q "$GITHUB_WORKSPACE/app/libs/libv2ray.aar"
+        echo "=== Isi libv2ray.aar (top-level) ==="
+        ls -la
+        echo ""
+        echo "=== Semua nama class di dalam classes.jar (filter yang mengandung 'ray' atau 'point', case-insensitive) ==="
+        unzip -l classes.jar | grep -iE "ray|point" || echo "(tidak ada yang cocok filter, ini daftar SEMUA class:)"
+        unzip -l classes.jar | head -100
+        echo ""
+        echo "=== javap -p pada semua class kandidat (yang namanya mengandung V2Ray/Libv2ray) ==="
+        mkdir -p extracted
+        cd extracted
+        unzip -o -q ../classes.jar
+        find . -iname "*.class" | grep -iE "v2ray|libv2ray" | while read -r f; do
+          CLASSNAME=$(echo "$f" | sed 's|^\./||; s|\.class$||; s|/|.|g')
+          echo "--- javap -p $CLASSNAME ---"
+          javap -p -classpath . "$CLASSNAME" || true
+          echo ""
+        done
+
     - name: Generate Debug Keystore
       run: |
         mkdir -p ~/.android
