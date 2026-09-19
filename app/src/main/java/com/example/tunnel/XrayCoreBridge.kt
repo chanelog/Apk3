@@ -17,14 +17,16 @@ import libv2ray.Libv2ray
  *   libv2ray.CoreCallbackHandler { onEmitStatus(Long,String):Long; shutdown():Long; startup():Long }
  *   libv2ray.CoreController { startLoop(String,Int); stopLoop(); isRunning: Boolean }
  *
- * SATU-SATUNYA hal yang masih belum 100% pasti: arti parameter kedua
- * (Int) di startLoop(configJson, ???) — saya pakai 0 sebagai default aman.
- * Kalau start() melempar error aneh yang menyebut domain strategy / IPv6 /
- * semacamnya, kemungkinan itu penyebabnya — kirim pesan errornya ke Claude.
+ * Revisi 5 — ketemu dokumentasi resmi terbaru (pkg.go.dev, published Sep 2026)
+ * yang mengungkap parameter kedua StartLoop itu adalah TUN FILE DESCRIPTOR,
+ * bukan flag sembarang:
  *
- * Tidak ada method protect()/setup() di interface ini — Xray-core jalan
- * satu proses dengan app kita, jadi builder.addDisallowedApplication(packageName)
- * di HnTunnelVpnService.kt sudah cukup meng-exclude trafik Xray dari TUN kita sendiri.
+ *   func (x *CoreController) StartLoop(configContent string, tunFd int32) (err error)
+ *
+ * Artinya versi Xray-core ini sudah punya tun2socks BAWAAN sendiri di
+ * dalamnya — beda dari dugaan awal (Xray cuma buka SOCKS lokal, lalu
+ * dijembatani tun2socks terpisah). Untuk jalur Xray, HevSocks5Bridge
+ * (tun2socks) TIDAK dipakai sama sekali — Xray langsung pegang TUN fd-nya.
  */
 object XrayCoreBridge {
 
@@ -41,15 +43,15 @@ object XrayCoreBridge {
   }
 
   @Throws(Exception::class)
-  fun start(configJson: String, assetsPath: String) {
+  fun start(configJson: String, tunFd: Int, assetsPath: String) {
     if (!envInitialized) {
       Libv2ray.initCoreEnv(assetsPath, "")
       envInitialized = true
     }
     val ctrl = Libv2ray.newCoreController(Callback())
-    ctrl.startLoop(configJson, 0)
+    ctrl.startLoop(configJson, tunFd)
     controller = ctrl
-    LogManager.d("Xray startLoop dipanggil, menunggu status konek...")
+    LogManager.d("Xray startLoop dipanggil dengan tunFd=$tunFd, menunggu status konek...")
   }
 
   fun stop() {
