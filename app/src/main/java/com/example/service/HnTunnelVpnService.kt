@@ -84,9 +84,6 @@ class HnTunnelVpnService : VpnService() {
         LogManager.i("Tunnel Mode: ${config.type.displayName}")
         LogManager.i("Profile: ${config.name}")
 
-        // 1. Sambungkan backend (SSH atau, nanti, Xray) SEBELUM TUN interface
-        //    dibuka, supaya kalau backend gagal connect kita belum terlanjur
-        //    mem-blackhole semua trafik user.
         TunnelController.updateState(TunnelState.HANDSHAKING)
         when (config.type) {
           TunnelType.SSH_DIRECT, TunnelType.SSH_SSL_TLS, TunnelType.SSH_HTTP_PROXY ->
@@ -95,7 +92,6 @@ class HnTunnelVpnService : VpnService() {
             connectXrayBackend(config)
         }
 
-        // 2. Baru sekarang buka TUN interface
         LogManager.d("Allocating virtual network interface (TUN)...")
         val builder = Builder()
           .setMtu(1500)
@@ -107,16 +103,12 @@ class HnTunnelVpnService : VpnService() {
         builder.addDnsServer(primaryDns)
         builder.addDnsServer(secondaryDns)
 
-        // Baik DIRECT_TUNNEL maupun GLOBAL_TUN sama-sama route semua trafik ke TUN,
-        // karena penyaringan "internet normal tetap jalan" sekarang dilakukan oleh
-        // tun2socks + backend proxy, bukan oleh routing table VPN lagi.
         builder.addRoute("0.0.0.0", 0)
         LogManager.i("Routing mode: ${config.routingMode}")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
           builder.setMetered(false)
         }
-        // Cegah aplikasi ini sendiri ikut terjebak lewat TUN (hindari routing loop)
         try {
           builder.addDisallowedApplication(packageName)
         } catch (e: Exception) {
@@ -132,7 +124,6 @@ class HnTunnelVpnService : VpnService() {
         vpnInterface = pfd
         LogManager.s("Virtual interface tun0 established (MTU 1500).")
 
-        // 3. Jalankan tun2socks: jembatani TUN fd <-> SOCKS5 lokal (backend di atas)
         val started = HevSocks5Bridge.start(
           context = this@HnTunnelVpnService,
           socksPort = LOCAL_SOCKS_PORT,
@@ -164,7 +155,7 @@ class HnTunnelVpnService : VpnService() {
     LogManager.i("Membuka koneksi SSH (${config.type.displayName}) ke ${config.sshHost}:${config.sshPort}...")
     TunnelController.updateState(TunnelState.AUTHENTICATING)
     val bridge = SshSocksBridge(LOCAL_SOCKS_PORT)
-    bridge.start(config) // melempar exception kalau gagal -> ditangkap di startTunnel()
+    bridge.start(config) { socket -> protect(socket) } // protect() = VpnService.protect(Socket)
     sshBridge = bridge
     LogManager.s("SSH tersambung, SOCKS5 lokal dibuka di 127.0.0.1:$LOCAL_SOCKS_PORT")
   }
@@ -187,7 +178,6 @@ class HnTunnelVpnService : VpnService() {
         delay(1000)
         seconds++
 
-        // [txPackets, txBytes, rxPackets, rxBytes] — lihat TProxyGetStats() di README resmi
         val raw = HevSocks5Bridge.stats()
         val txBytes = raw?.getOrNull(1) ?: lastTxBytes
         val rxBytes = raw?.getOrNull(3) ?: lastRxBytes
