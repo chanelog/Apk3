@@ -8,7 +8,6 @@ import com.jcraft.jsch.ChannelDirectTCPIP
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Proxy
 import com.jcraft.jsch.Session
-import com.jcraft.jsch.SocketFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,6 +21,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import com.jcraft.jsch.SocketFactory
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
@@ -45,9 +45,12 @@ class SshSocksBridge(private val localSocksPort: Int) {
   @Volatile var isConnected: Boolean = false
     private set
 
-  /** Membuka koneksi SSH sesuai TunnelType, lalu mulai SOCKS5 server lokal. */
+  /** Membuka koneksi SSH sesuai TunnelType, lalu mulai SOCKS5 server lokal.
+   * [protectSocket] WAJIB terhubung ke VpnService.protect(socket) supaya
+   * socket kontrol SSH ini tidak ikut "tersedot" balik ke TUN interface
+   * (baik punya sendiri maupun sisa sesi VPN lain yang masih aktif). */
   @Throws(Exception::class)
-  fun start(config: TunnelConfig) {
+  fun start(config: TunnelConfig, protectSocket: (Socket) -> Boolean) {
     val jsch = JSch()
     val newSession = jsch.getSession(config.sshUsername, config.sshHost, config.sshPort)
     newSession.setConfig("StrictHostKeyChecking", "no")
@@ -62,7 +65,8 @@ class SshSocksBridge(private val localSocksPort: Int) {
             connectHost = config.sshHost,
             connectPort = config.sshPort,
             sniHost = config.sniHost,
-            allowInsecure = true
+            allowInsecure = true,
+            protectSocket = protectSocket
           )
         )
       }
@@ -75,12 +79,19 @@ class SshSocksBridge(private val localSocksPort: Int) {
             proxyPort = proxyTarget.second,
             payloadTemplate = config.payload,
             targetHost = config.sshHost,
-            targetPort = config.sshPort
+            targetPort = config.sshPort,
+            protectSocket = protectSocket
           )
         )
       }
       TunnelType.SSH_DIRECT -> {
-        // Tidak perlu Proxy, JSch connect langsung ke sshHost:sshPort
+        newSession.setProxy(
+          DirectProxy(
+            connectHost = config.sshHost,
+            connectPort = config.sshPort,
+            protectSocket = protectSocket
+          )
+        )
       }
       else -> throw IllegalArgumentException("SshSocksBridge dipanggil untuk tipe non-SSH: ${config.type}")
     }
@@ -101,7 +112,7 @@ class SshSocksBridge(private val localSocksPort: Int) {
         val client = try {
           server.accept()
         } catch (e: IOException) {
-          break // server socket ditutup saat stop()
+          break
         }
         launch { handleSocksClient(client) }
       }
@@ -114,38 +125,35 @@ class SshSocksBridge(private val localSocksPort: Int) {
       val input = client.getInputStream()
       val output = client.getOutputStream()
 
-      // --- SOCKS5 greeting ---
       val ver = input.read()
       if (ver != 0x05) { client.close(); return }
       val nMethods = input.read()
       val methods = ByteArray(nMethods)
       readFully(input, methods)
-      // Selalu balas "no authentication required"
       output.write(byteArrayOf(0x05, 0x00))
       output.flush()
 
-      // --- SOCKS5 request ---
       val reqVer = input.read()
       val cmd = input.read()
-      input.read() // reserved
+      input.read()
       val atyp = input.read()
-      if (reqVer != 0x05 || cmd != 0x01) { // hanya dukung CONNECT
+      if (reqVer != 0x05 || cmd != 0x01) {
         output.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
         client.close()
         return
       }
 
       val targetHost: String = when (atyp) {
-        0x01 -> { // IPv4
+        0x01 -> {
           val addr = ByteArray(4); readFully(input, addr)
           addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
         }
-        0x03 -> { // domain name
+        0x03 -> {
           val len = input.read()
           val domain = ByteArray(len); readFully(input, domain)
           String(domain, Charsets.US_ASCII)
         }
-        0x04 -> { // IPv6 - jarang dipakai, fallback sederhana
+        0x04 -> {
           val addr = ByteArray(16); readFully(input, addr)
           java.net.InetAddress.getByAddress(addr).hostAddress ?: ""
         }
@@ -166,7 +174,6 @@ class SshSocksBridge(private val localSocksPort: Int) {
       channel.setPort(targetPort)
       channel.connect(10000)
 
-      // Balas sukses ke client (alamat bind tidak terlalu penting utk klien SOCKS kebanyakan)
       output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
       output.flush()
 
@@ -218,21 +225,40 @@ class SshSocksBridge(private val localSocksPort: Int) {
     session = null
   }
 
-  /**
-   * Proxy JSch kustom: buka TCP ke [connectHost]:[connectPort], bungkus TLS
-   * dengan SNI kustom [sniHost] (teknik "bug host"/CDN), lalu serahkan stream
-   * hasilnya ke JSch seolah itu koneksi langsung ke server SSH.
-   */
-  private class TlsSniProxy(
+  private class DirectProxy(
     private val connectHost: String,
     private val connectPort: Int,
-    private val sniHost: String,
-    private val allowInsecure: Boolean
+    private val protectSocket: (Socket) -> Boolean
   ) : Proxy {
     private lateinit var socket: Socket
 
     override fun connect(socket_factory: SocketFactory?, host: String?, port: Int, timeout: Int) {
       val raw = Socket()
+      protectSocket(raw)
+      raw.connect(InetSocketAddress(connectHost, connectPort), timeout)
+      socket = raw
+    }
+
+    override fun getInputStream(): InputStream = socket.getInputStream()
+    override fun getOutputStream(): OutputStream = socket.getOutputStream()
+    override fun getSocket(): Socket = socket
+    override fun close() {
+      try { socket.close() } catch (ignored: Exception) {}
+    }
+  }
+
+  private class TlsSniProxy(
+    private val connectHost: String,
+    private val connectPort: Int,
+    private val sniHost: String,
+    private val allowInsecure: Boolean,
+    private val protectSocket: (Socket) -> Boolean
+  ) : Proxy {
+    private lateinit var socket: Socket
+
+    override fun connect(socket_factory: SocketFactory?, host: String?, port: Int, timeout: Int) {
+      val raw = Socket()
+      protectSocket(raw)
       raw.connect(InetSocketAddress(connectHost, connectPort), timeout)
 
       val sslContext = SSLContext.getInstance("TLS")
@@ -263,23 +289,19 @@ class SshSocksBridge(private val localSocksPort: Int) {
     }
   }
 
-  /**
-   * Proxy JSch kustom: buka TCP ke server proxy remote, kirim [payloadTemplate]
-   * (placeholder [host]/[host_port]/[crlf] sudah disubstitusi), lalu lanjutkan
-   * stream yang sama untuk handshake SSH. Ini pola payload injection khas
-   * aplikasi HTTP Custom/HTTP Injector.
-   */
   private class PayloadInjectProxy(
     private val proxyHost: String,
     private val proxyPort: Int,
     private val payloadTemplate: String,
     private val targetHost: String,
-    private val targetPort: Int
+    private val targetPort: Int,
+    private val protectSocket: (Socket) -> Boolean
   ) : Proxy {
     private lateinit var socket: Socket
 
     override fun connect(socket_factory: SocketFactory?, host: String?, port: Int, timeout: Int) {
       val raw = Socket()
+      protectSocket(raw)
       raw.connect(InetSocketAddress(proxyHost, proxyPort), timeout)
 
       val hostPort = "$targetHost:$targetPort"
@@ -293,7 +315,6 @@ class SshSocksBridge(private val localSocksPort: Int) {
         flush()
       }
 
-      // Baca response header sampai baris kosong, cek ada "200" (Connection Established)
       val response = StringBuilder()
       val buf = ByteArray(1)
       var newlineCount = 0
