@@ -62,6 +62,12 @@ android {
       useLegacyPackaging = true
     }
   }
+  // Folder tempat CI menaruh hasil ndk-build hev-socks5-tunnel (libs/<abi>/*.so)
+  sourceSets {
+    getByName("main") {
+      jniLibs.srcDirs("src/main/jniLibs")
+    }
+  }
   testOptions { unitTests { isIncludeAndroidResources = true } }
   dependenciesInfo {
     includeInApk = false
@@ -126,9 +132,9 @@ dependencies {
   // Backend SSH sungguhan (menggantikan simulasi delay()) — fork JSch yang
   // masih aktif dipelihara, API-compatible dengan com.jcraft.jsch.*
   implementation("com.github.mwiede:jsch:2.28.4")
-  // tun2socks (hev-socks5-tunnel) — file .aar prebuilt didownload oleh CI
-  // ke app/libs/hev-socks5-tunnel.aar (lihat .github/workflows/build.yml)
-  implementation(files("libs/hev-socks5-tunnel.aar"))
+  // tun2socks (hev-socks5-tunnel) — hasil ndk-build ditaruh CI di
+  // app/src/main/jniLibs/<abi>/libhev-socks5-tunnel.so (lihat build.yml)
+  // TIDAK pakai dependency .aar lagi — tidak ada rilis .aar untuk library ini.
   // Xray-core (V2Ray/VLESS/Trojan) — file .aar prebuilt didownload CI ke
   // app/libs/libv2ray.aar (lihat .github/workflows/build.yml)
   implementation(files("libs/libv2ray.aar"))
