@@ -26,8 +26,22 @@ jobs:
     - name: Download prebuilt hev-socks5-tunnel.aar
       run: |
         mkdir -p app/libs
-        curl -L -o app/libs/hev-socks5-tunnel.aar \
-          https://github.com/heiher/hev-socks5-tunnel/releases/latest/download/hev-socks5-tunnel.aar
+        AAR_URL=$(curl -s https://api.github.com/repos/heiher/hev-socks5-tunnel/releases/latest \
+          | grep -o '"browser_download_url": *"[^"]*\.aar"' \
+          | sed -E 's/.*"(https:[^"]+)"/\1/' | head -n1)
+        echo "URL asset .aar ditemukan: $AAR_URL"
+        if [ -z "$AAR_URL" ]; then
+          echo "::error::Tidak ada file .aar di rilis terbaru hev-socks5-tunnel — cek manual di https://github.com/heiher/hev-socks5-tunnel/releases"
+          exit 1
+        fi
+        curl -L -o app/libs/hev-socks5-tunnel.aar "$AAR_URL"
+        SIZE=$(stat -c%s app/libs/hev-socks5-tunnel.aar)
+        echo "Ukuran file hasil download: $SIZE bytes"
+        if [ "$SIZE" -lt 10000 ]; then
+          echo "::error::File .aar yang terdownload terlalu kecil ($SIZE bytes) — kemungkinan bukan file .aar asli. Isi file:"
+          cat app/libs/hev-socks5-tunnel.aar
+          exit 1
+        fi
         ls -la app/libs/
 
     - name: Download prebuilt libv2ray.aar (Xray-core)
@@ -35,6 +49,13 @@ jobs:
         mkdir -p app/libs
         curl -L -o app/libs/libv2ray.aar \
           https://github.com/2dust/AndroidLibXrayLite/releases/latest/download/libv2ray.aar
+        SIZE=$(stat -c%s app/libs/libv2ray.aar)
+        echo "Ukuran file hasil download: $SIZE bytes"
+        if [ "$SIZE" -lt 10000 ]; then
+          echo "::error::libv2ray.aar yang terdownload terlalu kecil ($SIZE bytes) — kemungkinan bukan file .aar asli. Isi file:"
+          cat app/libs/libv2ray.aar
+          exit 1
+        fi
         ls -la app/libs/
     # --- akhir step baru ---
 
