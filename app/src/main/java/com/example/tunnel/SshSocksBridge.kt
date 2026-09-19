@@ -8,6 +8,7 @@ import com.jcraft.jsch.ChannelDirectTCPIP
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Proxy
 import com.jcraft.jsch.Session
+import com.jcraft.jsch.SocketFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,7 +22,6 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
-import javax.net.SocketFactory
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
