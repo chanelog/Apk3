@@ -4,32 +4,55 @@ import android.content.Context
 import com.example.util.LogManager
 import java.io.File
 
-/** Runs the Xray ELF shipped in the APK native library directory. */
+/** Runs the Xray ELF packaged in the APK native library directory. */
 object XrayProcessBridge {
   private var process: Process? = null
   private var configFile: File? = null
 
   fun start(context: Context, configJson: String, socksPort: Int): Boolean {
     stop()
+
+    // Do not execute a binary copied to filesDir or assets: those locations
+    // may be mounted noexec and cause EACCES. CI packages Xray here instead.
     val binary = File(context.applicationInfo.nativeLibraryDir, "libxray.so")
     if (!binary.isFile || !binary.canExecute()) {
-      LogManager.e("Xray executable tidak ditemukan di ${binary.absolutePath}. Build harus memasukkan jniLibs/arm64-v8a/libxray.so")
+      LogManager.e("Xray executable tidak ditemukan atau tidak executable: ${binary.absolutePath}")
       return false
     }
-    val dir = File(context.filesDir, "xray-config")
-    if (!dir.exists() && !dir.mkdirs()) return false
-    configFile = File(dir, "config.json").apply { writeText(configJson) }
+    LogManager.d("Xray binary: ${binary.absolutePath}")
+
+    val configDir = File(context.filesDir, "xray-config")
+    if (!configDir.exists() && !configDir.mkdirs()) {
+      LogManager.e("Tidak bisa membuat direktori konfigurasi Xray")
+      return false
+    }
+    configFile = File(configDir, "config.json").apply { writeText(configJson) }
+
     return try {
-      process = ProcessBuilder(binary.absolutePath, "run", "-config", configFile!!.absolutePath)
-        .redirectErrorStream(true)
-        .start()
+      process = ProcessBuilder(
+        binary.absolutePath,
+        "run",
+        "-config",
+        configFile!!.absolutePath
+      ).redirectErrorStream(true).start()
+
       Thread {
-        try { process?.inputStream?.bufferedReader()?.forEachLine { LogManager.d("Xray: $it") } }
-        catch (_: Exception) { }
-      }.apply { name = "xray-log-reader"; isDaemon = true; start() }
+        try {
+          process?.inputStream?.bufferedReader()?.forEachLine { line ->
+            LogManager.d("Xray: $line")
+          }
+        } catch (_: Exception) {
+          // Expected when the process is stopped.
+        }
+      }.apply {
+        name = "xray-log-reader"
+        isDaemon = true
+        start()
+      }
+
       Thread.sleep(250)
       if (process?.isAlive != true) {
-        LogManager.e("Xray berhenti setelah start")
+        LogManager.e("Xray berhenti setelah start; periksa log Xray di atas")
         stop()
         false
       } else {
