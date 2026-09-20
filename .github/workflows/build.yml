@@ -30,58 +30,76 @@ jobs:
 
     - name: Clone & build hev-socks5-tunnel (tun2socks)
       run: |
-        mkdir -p hev-build
-        cd hev-build
-        git clone --recursive https://github.com/heiher/hev-socks5-tunnel jni
-        "${{ steps.setup-ndk.outputs.ndk-path }}/ndk-build" -j$(nproc)
-        find libs -type f | head
+        set -e
+        git clone --recursive https://github.com/heiher/hev-socks5-tunnel hev-build
+        "${{ steps.setup-ndk.outputs.ndk-path }}/ndk-build" -C hev-build/jni -j$(nproc)
+        find hev-build/jni/libs -type f | head
 
     - name: Copy tun2socks .so to app/src/main/jniLibs
       run: |
+        set -e
         mkdir -p app/src/main/jniLibs
-        cp -r hev-build/libs/* app/src/main/jniLibs/
+        cp -r hev-build/jni/libs/* app/src/main/jniLibs/
         find app/src/main/jniLibs -type f
 
     - name: Download Xray Android arm64 binary
       run: |
-        mkdir -p app/src/main/assets/xray
-        curl -L -o /tmp/xray-arm64.zip https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-android-arm64-v8a.zip
+        set -e
+        rm -rf /tmp/xray-arm64
+        mkdir -p /tmp/xray-arm64 app/src/main/jniLibs/arm64-v8a
+
+        curl -fL \
+          -o /tmp/xray-arm64.zip \
+          https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-android-arm64-v8a.zip
+
         unzip -o /tmp/xray-arm64.zip -d /tmp/xray-arm64
-        find /tmp/xray-arm64 -type f | head -50
         XRAY_BIN=$(find /tmp/xray-arm64 -type f -name xray | head -n 1)
+
         if [ -z "$XRAY_BIN" ]; then
-          echo "::error::xray binary not found in downloaded zip"
+          echo "::error::Binary Xray tidak ditemukan"
+          find /tmp/xray-arm64 -type f
           exit 1
         fi
-        cp "$XRAY_BIN" app/src/main/assets/xray/xray
-        chmod +x app/src/main/assets/xray/xray
-        ls -l app/src/main/assets/xray
 
-    - name: Download prebuilt libv2ray.aar (fallback only)
+        cp "$XRAY_BIN" app/src/main/jniLibs/arm64-v8a/libxray.so
+        chmod 755 app/src/main/jniLibs/arm64-v8a/libxray.so
+
+        echo "Binary Xray yang dipaketkan:"
+        ls -l app/src/main/jniLibs/arm64-v8a/libxray.so
+        file app/src/main/jniLibs/arm64-v8a/libxray.so
+
+    - name: Download libv2ray.aar for legacy bridge compilation
       run: |
+        set -e
         mkdir -p app/libs
-        curl -L -o app/libs/libv2ray.aar \
+        curl -fL \
+          -o app/libs/libv2ray.aar \
           https://github.com/2dust/AndroidLibXrayLite/releases/latest/download/libv2ray.aar
         SIZE=$(stat -c%s app/libs/libv2ray.aar)
-        echo "Ukuran file hasil download: $SIZE bytes"
+        echo "Ukuran libv2ray.aar: $SIZE bytes"
         if [ "$SIZE" -lt 10000 ]; then
-          echo "::error::libv2ray.aar yang terdownload terlalu kecil ($SIZE bytes)"
-          cat app/libs/libv2ray.aar
+          echo "::error::libv2ray.aar terlalu kecil atau download gagal"
           exit 1
         fi
-        ls -la app/libs/
 
     - name: Generate Debug Keystore
       run: |
+        set -e
         mkdir -p ~/.android
-        keytool -genkey -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+        keytool -genkey -v \
+          -keystore ~/.android/debug.keystore \
+          -storepass android \
+          -alias androiddebugkey \
+          -keypass android \
+          -keyalg RSA \
+          -keysize 2048 \
+          -validity 10000 \
+          -dname "CN=Android Debug,O=Android,C=US"
         cp ~/.android/debug.keystore ./debug.keystore || true
 
     - name: Grant execute permission for gradlew
       run: |
-        if [ ! -f "gradlew" ]; then
-          gradle wrapper
-        fi
+        if [ ! -f "gradlew" ]; then gradle wrapper; fi
         chmod +x gradlew
 
     - name: Build Debug APK
