@@ -28,331 +28,71 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.InetSocketAddress
+import java.net.Socket
 
 class HnTunnelVpnService : VpnService() {
-
-  companion object {
-    const val ACTION_START = "com.example.service.START"
-    const val ACTION_STOP = "com.example.service.STOP"
-    private const val NOTIFICATION_ID = 8844
-    private const val CHANNEL_ID = "hn_tunnel_vpn_channel"
-    private const val LOCAL_SOCKS_PORT = 10808
-  }
-
+  companion object { const val ACTION_START = "com.example.service.START"; const val ACTION_STOP = "com.example.service.STOP"; private const val NOTIFICATION_ID = 8844; private const val CHANNEL_ID = "hn_tunnel_vpn_channel"; private const val LOCAL_SOCKS_PORT = 10808 }
   private var vpnInterface: ParcelFileDescriptor? = null
   private var wakeLock: PowerManager.WakeLock? = null
   private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
   private var tunnelJob: Job? = null
   private var statsJob: Job? = null
-
   private var sshBridge: SshSocksBridge? = null
 
-  override fun onCreate() {
-    super.onCreate()
-    createNotificationChannel()
-    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-    wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HnTunnel::WakeLock")
-  }
-
-  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    when (intent?.action) {
-      ACTION_START -> {
-        val config = TunnelController.activeConfig.value
-        startTunnel(config)
-      }
-      ACTION_STOP -> {
-        stopTunnel()
-      }
-    }
-    return START_NOT_STICKY
-  }
+  override fun onCreate() { super.onCreate(); createNotificationChannel(); wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HnTunnel::WakeLock") }
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int { when (intent?.action) { ACTION_START -> startTunnel(TunnelController.activeConfig.value); ACTION_STOP -> stopTunnel() }; return START_NOT_STICKY }
 
   private fun startTunnel(config: TunnelConfig) {
-    if (TunnelController.tunnelState.value == TunnelState.CONNECTED) {
-      return
-    }
-
-    wakeLock?.acquire(24 * 60 * 60 * 1000L) // 24 hours max
-    val initialNotification = buildNotification("Connecting to ${config.name}...", "Initializing tunnel engine")
-    startForeground(NOTIFICATION_ID, initialNotification)
-
+    if (TunnelController.tunnelState.value == TunnelState.CONNECTED) return
+    wakeLock?.acquire(24 * 60 * 60 * 1000L); startForeground(NOTIFICATION_ID, buildNotification("Connecting to ${config.name}...", "Initializing tunnel engine"))
     tunnelJob?.cancel()
     tunnelJob = serviceScope.launch {
       try {
-        TunnelController.updateState(TunnelState.CONNECTING)
-        LogManager.i("Starting HN Tunnel Engine...")
-        LogManager.i("Tunnel Mode: ${config.type.displayName}")
-        LogManager.i("Profile: ${config.name}")
-
-        // 1. Buka TUN interface dulu (dibutuhkan lebih awal karena Xray-core
-        //    versi baru butuh tunFd langsung, bukan lewat tun2socks terpisah).
-        LogManager.d("Allocating virtual network interface (TUN)...")
-        val builder = Builder()
-          .setMtu(1500)
-          .addAddress("10.8.0.2", 32)
-          .setSession("HN Tunnel - ${config.name}")
-
-        val primaryDns = if (config.customDns1.isNotBlank()) config.customDns1 else "8.8.8.8"
-        val secondaryDns = if (config.customDns2.isNotBlank()) config.customDns2 else "1.1.1.1"
-        builder.addDnsServer(primaryDns)
-        builder.addDnsServer(secondaryDns)
-
-        builder.addRoute("0.0.0.0", 0)
-        LogManager.i("Routing mode: ${config.routingMode}")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-          builder.setMetered(false)
-        }
-        try {
-          builder.addDisallowedApplication(packageName)
-        } catch (e: Exception) {
-          LogManager.w("Tidak bisa exclude package sendiri: ${e.message}")
-        }
-
-        val pfd = builder.establish()
-        if (pfd == null) {
-          LogManager.e("Failed to establish VPN interface. Permission might be revoked.")
-          stopTunnel()
-          return@launch
-        }
-        vpnInterface = pfd
-        LogManager.s("Virtual interface tun0 established (MTU 1500).")
-        startTunActivityMonitor(pfd)
-
-        // 2. Sambungkan backend sesuai jenis tunnel.
+        TunnelController.updateState(TunnelState.CONNECTING); LogManager.i("Starting HN Tunnel Engine..."); LogManager.i("Tunnel Mode: ${config.type.displayName}")
+        val builder = Builder().setMtu(1500).addAddress("10.8.0.2", 32).setSession("HN Tunnel - ${config.name}")
+        builder.addDnsServer(if (config.customDns1.isNotBlank()) config.customDns1 else "8.8.8.8"); builder.addDnsServer(if (config.customDns2.isNotBlank()) config.customDns2 else "1.1.1.1"); builder.addRoute("0.0.0.0", 0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
+        try { builder.addDisallowedApplication(packageName) } catch (e: Exception) { LogManager.w("Tidak bisa exclude package sendiri: ${e.message}") }
+        val pfd = builder.establish() ?: throw IllegalStateException("Failed to establish VPN interface")
+        vpnInterface = pfd; LogManager.s("Virtual interface tun0 established")
         TunnelController.updateState(TunnelState.HANDSHAKING)
         when (config.type) {
-          TunnelType.SSH_DIRECT, TunnelType.SSH_SSL_TLS, TunnelType.SSH_HTTP_PROXY -> {
-            // SSH tidak punya tun2socks bawaan -> connect SSH dulu, baru
-            // jembatani TUN fd ke SOCKS5 lokal SSH lewat HevSocks5Bridge.
-            connectSshBackend(config)
-            val started = HevSocks5Bridge.start(
-              context = this@HnTunnelVpnService,
-              socksPort = LOCAL_SOCKS_PORT,
-              enableUdp = config.enableUdp,
-              tunFd = pfd.fd
-            )
-            if (!started) {
-              LogManager.e("tun2socks gagal start. Cek logcat filter TProxyService/hev-socks5-tunnel.")
-              stopTunnel()
-              return@launch
-            }
-            LogManager.s("tun2socks aktif, trafik TUN diarahkan ke SOCKS5 127.0.0.1:$LOCAL_SOCKS_PORT")
-          }
-          TunnelType.V2RAY_VMESS, TunnelType.V2RAY_VLESS, TunnelType.TROJAN -> {
-            // Xray-core versi ini pegang TUN fd LANGSUNG (tun2socks bawaan),
-            // jadi HevSocks5Bridge tidak dipakai untuk jalur ini.
-            connectXrayBackend(config, tunFd = pfd.fd)
-          }
+          TunnelType.SSH_DIRECT, TunnelType.SSH_SSL_TLS, TunnelType.SSH_HTTP_PROXY -> { connectSshBackend(config); if (!HevSocks5Bridge.start(this@HnTunnelVpnService, LOCAL_SOCKS_PORT, enableUdp = config.enableUdp, tunFd = pfd.fd)) throw IllegalStateException("tun2socks gagal start") }
+          TunnelType.V2RAY_VMESS, TunnelType.V2RAY_VLESS, TunnelType.TROJAN -> connectXrayBackend(config, pfd.fd)
         }
-
-        TunnelController.updateState(TunnelState.CONNECTED)
-        LogManager.s("Tunnel successfully connected! Internet data bridge is ACTIVE.")
-        updateNotification("Connected: ${config.name}", "HN Tunnel Active")
-
-        startStatsMonitor(config)
-
-      } catch (e: Exception) {
-        LogManager.e("Tunnel connection failed: ${e.message}")
-        TunnelController.updateState(TunnelState.DISCONNECTED)
-        stopTunnel()
-      }
+        if (!verifySocksConnectivity()) throw IllegalStateException("Backend hidup tetapi tidak dapat meneruskan koneksi HTTPS")
+        TunnelController.updateState(TunnelState.CONNECTED); LogManager.s("Tunnel connected: connectivity check berhasil"); updateNotification("Connected: ${config.name}", "HN Tunnel Active"); startStatsMonitor(config)
+      } catch (e: Exception) { LogManager.e("Tunnel connection failed: ${e.message}"); TunnelController.updateState(TunnelState.DISCONNECTED); stopTunnel() }
     }
   }
 
-  /**
-   * Diagnostik pasif: cek apakah OS Android BENAR-BENAR mengirim paket ke TUN
-   * interface kita atau tidak, tanpa mengambil/mengganggu data yang sudah ada
-   * (cuma poll(), tidak read()).
-   *
-   * PERBAIKAN: versi sebelumnya punya bug serius — poll() dengan timeout
-   * 1000ms itu CUMA nunggu maksimal 1 detik, tapi kalau data terus-menerus
-   * "siap dibaca" (misalnya karena backend belum sempat mengosongkan buffer),
-   * poll() balik HAMPIR SEKETIKA, bukan nunggu penuh 1 detik. Akibatnya loop
-   * ini muter jutaan kali per detik (busy-loop), which VERY LIKELY merebut
-   * jatah CPU dari thread yang seharusnya memproses paket beneran (tun2socks/
-   * Xray) — jadi diagnostik ini sendiri kemungkinan JADI PENYEBAB macetnya.
-   * Sekarang dipaksa jeda minimal tiap putaran + hitung waktu asli (bukan
-   * jumlah iterasi) supaya tidak lagi jadi busy-loop.
-   */
-  private fun startTunActivityMonitor(pfd: ParcelFileDescriptor) {
-    serviceScope.launch(Dispatchers.IO) {
-      var totalHits = 0
-      var windowHits = 0
-      val startTime = System.currentTimeMillis()
-      var lastLogTime = startTime
+  private suspend fun verifySocksConnectivity(): Boolean = withContext(Dispatchers.IO) {
+    repeat(3) { attempt ->
       try {
-        val fd = pfd.fileDescriptor
-        while (isActive && vpnInterface != null) {
-          val pollfd = android.system.StructPollfd().apply {
-            this.fd = fd
-            this.events = android.system.OsConstants.POLLIN.toShort()
-          }
-          val n = try {
-            // timeout kecil (200ms) HANYA untuk sampling sesaat, BUKAN untuk
-            // menunggu lama — supaya tidak menahan thread terlalu lama pun
-            // tidak busy-loop.
-            android.system.Os.poll(arrayOf(pollfd), 200)
-          } catch (e: Exception) {
-            LogManager.d("DIAGNOSTIK: poll() TUN error: ${e.message}")
-            break
-          }
-          if (n > 0 && (pollfd.revents.toInt() and android.system.OsConstants.POLLIN) != 0) {
-            windowHits++
-            totalHits++
-          }
-
-          val now = System.currentTimeMillis()
-          if (now - lastLogTime >= 5000) {
-            val elapsedSec = (now - startTime) / 1000
-            if (totalHits == 0) {
-              LogManager.e("DIAGNOSTIK: TUN belum menerima paket APAPUN dalam ${elapsedSec}s. OS kemungkinan tidak merutekan trafik ke TUN kita.")
-            } else {
-              LogManager.d("DIAGNOSTIK: TUN aktif menerima paket ($windowHits sampel dalam 5s terakhir, total $totalHits sampel / ${elapsedSec}s).")
-            }
-            windowHits = 0
-            lastLogTime = now
-          }
-
-          // WAJIB: jeda ini yang kemarin hilang -> mencegah busy-loop.
-          delay(300)
+        delay(if (attempt == 0) 150 else 350)
+        Socket().use { socket ->
+          socket.soTimeout = 8000; socket.connect(InetSocketAddress("127.0.0.1", LOCAL_SOCKS_PORT), 2000)
+          val input = socket.getInputStream(); val output = socket.getOutputStream()
+          output.write(byteArrayOf(5, 1, 0)); output.flush()
+          if (input.read() != 5 || input.read() != 0) return@use
+          output.write(byteArrayOf(5, 1, 0, 1, 1, 1, 1, 1, 0, 443)); output.flush()
+          val reply = ByteArray(10); var offset = 0
+          while (offset < reply.size) { val n = input.read(reply, offset, reply.size - offset); if (n < 0) return@use; offset += n }
+          if (reply[0].toInt() == 5 && reply[1].toInt() == 0) { LogManager.s("Connectivity check: SOCKS -> 1.1.1.1:443 OK"); return@withContext true }
         }
-      } catch (e: Exception) {
-        LogManager.d("DIAGNOSTIK: monitor TUN berhenti: ${e.message}")
-      }
+      } catch (e: Exception) { LogManager.d("Connectivity check attempt ${attempt + 1}: ${e.message}") }
     }
+    false
   }
 
-  private suspend fun connectSshBackend(config: TunnelConfig) = withContext(Dispatchers.IO) {
-    LogManager.i("Membuka koneksi SSH (${config.type.displayName}) ke ${config.sshHost}:${config.sshPort}...")
-    TunnelController.updateState(TunnelState.AUTHENTICATING)
-    val bridge = SshSocksBridge(LOCAL_SOCKS_PORT)
-    bridge.start(config) { socket -> protect(socket) } // protect() = VpnService.protect(Socket)
-    sshBridge = bridge
-    LogManager.s("SSH tersambung, SOCKS5 lokal dibuka di 127.0.0.1:$LOCAL_SOCKS_PORT")
-  }
+  private suspend fun connectSshBackend(config: TunnelConfig) = withContext(Dispatchers.IO) { TunnelController.updateState(TunnelState.AUTHENTICATING); val bridge = SshSocksBridge(LOCAL_SOCKS_PORT); bridge.start(config) { socket -> protect(socket) }; sshBridge = bridge; LogManager.s("SSH SOCKS lokal aktif") }
+  private suspend fun connectXrayBackend(config: TunnelConfig, tunFd: Int) = withContext(Dispatchers.IO) { TunnelController.updateState(TunnelState.AUTHENTICATING); XrayCoreBridge.start(com.example.tunnel.XrayConfigBuilder.build(config, LOCAL_SOCKS_PORT), tunFd, filesDir.absolutePath); if (!XrayCoreBridge.isRunning()) throw IllegalStateException("Xray tidak running") }
 
-  private suspend fun connectXrayBackend(config: TunnelConfig, tunFd: Int) = withContext(Dispatchers.IO) {
-    LogManager.i("Menyiapkan Xray-core (${config.type.displayName})...")
-    TunnelController.updateState(TunnelState.AUTHENTICATING)
-    val json = com.example.tunnel.XrayConfigBuilder.build(config, LOCAL_SOCKS_PORT)
-    com.example.tunnel.XrayCoreBridge.start(json, tunFd = tunFd, assetsPath = filesDir.absolutePath)
-    LogManager.s("Xray-core tersambung, tun2socks bawaan Xray aktif di tunFd=$tunFd")
-  }
-
-  private fun startStatsMonitor(config: TunnelConfig) {
-    statsJob?.cancel()
-    statsJob = serviceScope.launch {
-      var seconds = 0L
-      var lastRxBytes = 0L
-      var lastTxBytes = 0L
-      while (isActive && TunnelController.tunnelState.value == TunnelState.CONNECTED) {
-        delay(1000)
-        seconds++
-
-        // [txPackets, txBytes, rxPackets, rxBytes] — lihat TProxyGetStats() di README resmi
-        val raw = HevSocks5Bridge.stats()
-        val txBytes = raw?.getOrNull(1) ?: lastTxBytes
-        val rxBytes = raw?.getOrNull(3) ?: lastRxBytes
-        val speedOut = (txBytes - lastTxBytes).coerceAtLeast(0)
-        val speedIn = (rxBytes - lastRxBytes).coerceAtLeast(0)
-        lastTxBytes = txBytes
-        lastRxBytes = rxBytes
-
-        val stats = TunnelStats(
-          bytesIn = rxBytes,
-          bytesOut = txBytes,
-          speedInBps = speedIn * 8,
-          speedOutBps = speedOut * 8,
-          pingMs = TunnelController.tunnelStats.value.pingMs,
-          durationSeconds = seconds
-        )
-        TunnelController.updateStats(stats)
-        if (seconds % 5 == 0L) {
-          updateNotification("HN Tunnel • ${stats.formatDuration()}", "Connected: ${config.name}")
-        }
-      }
-    }
-  }
-
-  private fun stopTunnel() {
-    serviceScope.launch {
-      TunnelController.updateState(TunnelState.STOPPING)
-      LogManager.i("Disconnecting HN Tunnel...")
-
-      statsJob?.cancel()
-      tunnelJob?.cancel()
-
-      try { HevSocks5Bridge.stop() } catch (ignored: Exception) {}
-      try { com.example.tunnel.XrayCoreBridge.stop() } catch (ignored: Exception) {}
-      try { sshBridge?.stop() } catch (ignored: Exception) {}
-      sshBridge = null
-
-      try { vpnInterface?.close() } catch (e: Exception) {}
-      vpnInterface = null
-
-      if (wakeLock?.isHeld == true) {
-        wakeLock?.release()
-      }
-
-      delay(300)
-      TunnelController.updateState(TunnelState.DISCONNECTED)
-      TunnelController.updateStats(TunnelStats())
-      LogManager.i("Tunnel disconnected. VPN interface closed.")
-
-      stopForeground(STOP_FOREGROUND_REMOVE)
-      stopSelf()
-    }
-  }
-
-  override fun onDestroy() {
-    stopTunnel()
-    super.onDestroy()
-  }
-
-  private fun createNotificationChannel() {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      val channel = NotificationChannel(
-        CHANNEL_ID,
-        "HN Tunnel Service",
-        NotificationManager.IMPORTANCE_LOW
-      ).apply {
-        description = "Displays active tunnel connection status and speed"
-        setShowBadge(false)
-      }
-      val manager = getSystemService(NotificationManager::class.java)
-      manager?.createNotificationChannel(channel)
-    }
-  }
-
-  private fun buildNotification(title: String, content: String): Notification {
-    val openIntent = Intent(this, MainActivity::class.java).apply {
-      flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-    }
-    val pendingOpenIntent = PendingIntent.getActivity(
-      this, 0, openIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-    )
-
-    val stopIntent = Intent(this, HnTunnelVpnService::class.java).apply {
-      action = ACTION_STOP
-    }
-    val pendingStopIntent = PendingIntent.getService(
-      this, 1, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-    )
-
-    return NotificationCompat.Builder(this, CHANNEL_ID)
-      .setSmallIcon(R.drawable.ic_launcher_foreground)
-      .setContentTitle(title)
-      .setContentText(content)
-      .setContentIntent(pendingOpenIntent)
-      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", pendingStopIntent)
-      .setOngoing(true)
-      .setPriority(NotificationCompat.PRIORITY_LOW)
-      .build()
-  }
-
-  private fun updateNotification(title: String, content: String) {
-    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-    manager?.notify(NOTIFICATION_ID, buildNotification(title, content))
-  }
+  private fun startStatsMonitor(config: TunnelConfig) { statsJob?.cancel(); statsJob = serviceScope.launch { var seconds = 0L; var lastRx = 0L; var lastTx = 0L; while (isActive && TunnelController.tunnelState.value == TunnelState.CONNECTED) { delay(1000); seconds++; val raw = HevSocks5Bridge.stats(); val tx = raw?.getOrNull(1) ?: lastTx; val rx = raw?.getOrNull(3) ?: lastRx; TunnelController.updateStats(TunnelStats(bytesIn = rx, bytesOut = tx, speedInBps = (rx - lastRx).coerceAtLeast(0) * 8, speedOutBps = (tx - lastTx).coerceAtLeast(0) * 8, durationSeconds = seconds)); lastRx = rx; lastTx = tx } } }
+  private fun stopTunnel() { serviceScope.launch { TunnelController.updateState(TunnelState.STOPPING); statsJob?.cancel(); tunnelJob?.cancel(); try { HevSocks5Bridge.stop() } catch (_: Exception) {}; try { com.example.tunnel.XrayCoreBridge.stop() } catch (_: Exception) {}; try { sshBridge?.stop() } catch (_: Exception) {}; sshBridge = null; try { vpnInterface?.close() } catch (_: Exception) {}; vpnInterface = null; if (wakeLock?.isHeld == true) wakeLock?.release(); TunnelController.updateState(TunnelState.DISCONNECTED); TunnelController.updateStats(TunnelStats()); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() } }
+  override fun onDestroy() { stopTunnel(); super.onDestroy() }
+  private fun createNotificationChannel() { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) getSystemService(NotificationManager::class.java)?.createNotificationChannel(NotificationChannel(CHANNEL_ID, "HN Tunnel Service", NotificationManager.IMPORTANCE_LOW)) }
+  private fun buildNotification(title: String, content: String): Notification { val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT); val stop = PendingIntent.getService(this, 1, Intent(this, HnTunnelVpnService::class.java).apply { action = ACTION_STOP }, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT); return NotificationCompat.Builder(this, CHANNEL_ID).setSmallIcon(R.drawable.ic_launcher_foreground).setContentTitle(title).setContentText(content).setContentIntent(open).addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stop).setOngoing(true).setPriority(NotificationCompat.PRIORITY_LOW).build() }
+  private fun updateNotification(title: String, content: String) { (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)?.notify(NOTIFICATION_ID, buildNotification(title, content)) }
 }
