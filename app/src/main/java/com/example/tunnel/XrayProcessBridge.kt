@@ -12,15 +12,21 @@ object XrayProcessBridge {
   fun start(context: Context, configJson: String, socksPort: Int): Boolean {
     stop()
 
-    val binary = installBundledBinary(context) ?: run {
-      LogManager.e("Xray binary tidak ditemukan di assets/xray/xray")
+    // Android commonly mounts filesDir/cacheDir with noexec. A native binary
+    // copied there therefore fails with EACCES even after chmod. Prefer the
+    // APK-extracted nativeLibraryDir, which is executable by Android.
+    val binary = resolveBinary(context) ?: run {
+      LogManager.e("Xray binary tidak ditemukan. Letakkan libxray.so di jniLibs/arm64-v8a atau assets/xray/xray")
       return false
     }
+    LogManager.d("Xray binary: ${binary.absolutePath}")
 
-    val dir = binary.parentFile ?: context.filesDir
-    configFile = File(dir, "xray-config.json").apply { writeText(configJson) }
+    val configDir = File(context.filesDir, "xray-config")
+    if (!configDir.exists()) configDir.mkdirs()
+    configFile = File(configDir, "config.json").apply { writeText(configJson) }
 
     return try {
+      // Xray 25.x uses the explicit `run` subcommand.
       process = ProcessBuilder(
         binary.absolutePath,
         "run",
@@ -28,8 +34,6 @@ object XrayProcessBridge {
         configFile!!.absolutePath
       ).redirectErrorStream(true).start()
 
-      // Always consume native output; otherwise the process can block when its
-      // stdout/stderr pipe becomes full. Keep useful diagnostics in app logs.
       Thread {
         try {
           process?.inputStream?.bufferedReader()?.forEachLine { line ->
@@ -44,9 +48,9 @@ object XrayProcessBridge {
         start()
       }
 
-      Thread.sleep(150)
+      Thread.sleep(200)
       if (process?.isAlive != true) {
-        LogManager.e("Xray berhenti setelah start; cek log Xray di atas")
+        LogManager.e("Xray berhenti setelah start; lihat log Xray sebelumnya")
         false
       } else {
         LogManager.s("Xray native process aktif, SOCKS port=$socksPort")
@@ -68,24 +72,30 @@ object XrayProcessBridge {
 
   fun isRunning(): Boolean = process?.isAlive == true
 
-  private fun installBundledBinary(context: Context): File? {
-    val target = File(context.filesDir, "xray/xray")
-    if (target.exists()) {
-      target.setExecutable(true, false)
-      if (target.canExecute()) return target
-    }
+  private fun resolveBinary(context: Context): File? {
+    val nativeBinary = File(context.applicationInfo.nativeLibraryDir, "libxray.so")
+    if (nativeBinary.exists() && nativeBinary.canExecute()) return nativeBinary
 
+    // Fallback for development builds where the binary is already installed.
+    val installed = File(context.filesDir, "xray/xray")
+    if (installed.exists() && installed.canExecute()) return installed
+
+    // Assets are copied only as a fallback. filesDir may be mounted noexec;
+    // this path is retained to produce a useful diagnostic if so.
     return try {
-      val parent = target.parentFile ?: return null
-      if (!parent.exists()) parent.mkdirs()
-      context.assets.open("xray/xray").use { input ->
-        target.outputStream().use { output -> input.copyTo(output) }
+      if (!installed.exists()) {
+        installed.parentFile?.mkdirs()
+        context.assets.open("xray/xray").use { input ->
+          installed.outputStream().use { output -> input.copyTo(output) }
+        }
+        installed.setExecutable(true, false)
       }
-      target.setReadable(true, false)
-      target.setExecutable(true, false)
-      if (target.canExecute()) target else null
+      if (installed.canExecute()) installed else {
+        LogManager.e("Binary Xray berada di filesDir tetapi filesystem noexec; gunakan libxray.so di nativeLibraryDir")
+        null
+      }
     } catch (e: Exception) {
-      LogManager.e("Gagal menyalin binary Xray dari assets: ${e.message}")
+      LogManager.e("Gagal menyiapkan binary Xray: ${e.message}")
       null
     }
   }
