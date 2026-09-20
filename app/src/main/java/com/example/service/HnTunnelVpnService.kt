@@ -163,14 +163,24 @@ class HnTunnelVpnService : VpnService() {
   /**
    * Diagnostik pasif: cek apakah OS Android BENAR-BENAR mengirim paket ke TUN
    * interface kita atau tidak, tanpa mengambil/mengganggu data yang sudah ada
-   * (cuma poll(), tidak read()) — supaya tidak bentrok dengan backend asli
-   * (HevSocks5Bridge/Xray) yang juga baca dari fd yang sama.
+   * (cuma poll(), tidak read()).
+   *
+   * PERBAIKAN: versi sebelumnya punya bug serius — poll() dengan timeout
+   * 1000ms itu CUMA nunggu maksimal 1 detik, tapi kalau data terus-menerus
+   * "siap dibaca" (misalnya karena backend belum sempat mengosongkan buffer),
+   * poll() balik HAMPIR SEKETIKA, bukan nunggu penuh 1 detik. Akibatnya loop
+   * ini muter jutaan kali per detik (busy-loop), which VERY LIKELY merebut
+   * jatah CPU dari thread yang seharusnya memproses paket beneran (tun2socks/
+   * Xray) — jadi diagnostik ini sendiri kemungkinan JADI PENYEBAB macetnya.
+   * Sekarang dipaksa jeda minimal tiap putaran + hitung waktu asli (bukan
+   * jumlah iterasi) supaya tidak lagi jadi busy-loop.
    */
   private fun startTunActivityMonitor(pfd: ParcelFileDescriptor) {
     serviceScope.launch(Dispatchers.IO) {
       var totalHits = 0
       var windowHits = 0
-      var seconds = 0
+      val startTime = System.currentTimeMillis()
+      var lastLogTime = startTime
       try {
         val fd = pfd.fileDescriptor
         while (isActive && vpnInterface != null) {
@@ -179,7 +189,10 @@ class HnTunnelVpnService : VpnService() {
             this.events = android.system.OsConstants.POLLIN.toShort()
           }
           val n = try {
-            android.system.Os.poll(arrayOf(pollfd), 1000)
+            // timeout kecil (200ms) HANYA untuk sampling sesaat, BUKAN untuk
+            // menunggu lama — supaya tidak menahan thread terlalu lama pun
+            // tidak busy-loop.
+            android.system.Os.poll(arrayOf(pollfd), 200)
           } catch (e: Exception) {
             LogManager.d("DIAGNOSTIK: poll() TUN error: ${e.message}")
             break
@@ -188,15 +201,21 @@ class HnTunnelVpnService : VpnService() {
             windowHits++
             totalHits++
           }
-          seconds++
-          if (seconds % 5 == 0) {
+
+          val now = System.currentTimeMillis()
+          if (now - lastLogTime >= 5000) {
+            val elapsedSec = (now - startTime) / 1000
             if (totalHits == 0) {
-              LogManager.e("DIAGNOSTIK: TUN belum menerima paket APAPUN dalam ${seconds}s. OS kemungkinan tidak merutekan trafik ke TUN kita.")
+              LogManager.e("DIAGNOSTIK: TUN belum menerima paket APAPUN dalam ${elapsedSec}s. OS kemungkinan tidak merutekan trafik ke TUN kita.")
             } else {
-              LogManager.d("DIAGNOSTIK: TUN aktif menerima paket (${windowHits}x dalam 5s terakhir, total ${totalHits}x).")
+              LogManager.d("DIAGNOSTIK: TUN aktif menerima paket ($windowHits sampel dalam 5s terakhir, total $totalHits sampel / ${elapsedSec}s).")
             }
             windowHits = 0
+            lastLogTime = now
           }
+
+          // WAJIB: jeda ini yang kemarin hilang -> mencegah busy-loop.
+          delay(300)
         }
       } catch (e: Exception) {
         LogManager.d("DIAGNOSTIK: monitor TUN berhenti: ${e.message}")
