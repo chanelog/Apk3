@@ -21,10 +21,11 @@ object XrayConfigBuilder {
 
     // WAJIB: tanpa ini, Xray sering "connected" tapi nggak bisa resolve domain
     // sama sekali (gejala persis "connect tapi internet nggak jalan").
-    val dnsServer1 = config.customDns1.ifBlank { "8.8.8.8" }
-    val dnsServer2 = config.customDns2.ifBlank { "1.1.1.1" }
+    // Dipakai format DoH (https://...) supaya query DNS ikut lewat TCP,
+    // bukan UDP biasa — penting khusus untuk transport WS yang cuma bisa
+    // bawa TCP (UDP biasa akan gagal total kalau outbound-nya VLESS+WS).
     root.put("dns", JSONObject().apply {
-      put("servers", JSONArray().put(dnsServer1).put(dnsServer2))
+      put("servers", JSONArray().put("https://8.8.8.8/dns-query").put("https://1.1.1.1/dns-query"))
     })
 
     root.put("inbounds", JSONArray().put(
@@ -101,6 +102,9 @@ object XrayConfigBuilder {
           put("security", "auto")
         }))
       }))
+      // Supaya trafik UDP (bukan cuma DNS) juga bisa ditunnel lewat transport
+      // yang aslinya cuma bisa bawa TCP (ws/tcp), server juga harus mendukung ini.
+      put("packetEncoding", "xudp")
     })
     put("streamSettings", streamSettings(config))
   }
@@ -117,6 +121,7 @@ object XrayConfigBuilder {
           put("encryption", "none")
         }))
       }))
+      put("packetEncoding", "xudp")
     })
     put("streamSettings", streamSettings(config))
   }
