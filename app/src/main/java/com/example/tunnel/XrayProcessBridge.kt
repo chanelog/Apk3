@@ -2,15 +2,10 @@ package com.example.tunnel
 
 import android.content.Context
 import java.io.File
-import kotlin.system.exitProcess
 
 /**
  * Runs the native Xray binary in SOCKS-only mode, matching the NetMod pattern:
  * VPN/TUN -> tun2socks -> local SOCKS 127.0.0.1:<port> -> Xray.
- *
- * This is intentionally kept separate from the libv2ray AAR bridge because the
- * AAR-based direct TUN path has proven unreliable for this project when used with
- * a SOCKS inbound and custom routing setup.
  */
 object XrayProcessBridge {
 
@@ -20,18 +15,9 @@ object XrayProcessBridge {
   fun start(context: Context, configJson: String, socksPort: Int): Boolean {
     stop()
 
-    val dir = File(context.filesDir, "xray")
+    val binary = resolveBinary(context) ?: return false
+    val dir = binary.parentFile ?: File(context.filesDir, "xray")
     if (!dir.exists()) dir.mkdirs()
-
-    val binary = File(dir, "xray")
-    if (!binary.exists()) {
-      // The workflow downloads the Android binary into app/src/main/assets/xray/xray
-      // for debug builds. If it is absent, we cannot start the native core.
-      return false
-    }
-    if (!binary.canExecute()) {
-      binary.setExecutable(true, false)
-    }
 
     configFile = File(dir, "xray-config.json")
     configFile?.writeText(configJson)
@@ -43,11 +29,11 @@ object XrayProcessBridge {
     )
       .redirectErrorStream(true)
 
-    try {
+    return try {
       process = builder.start()
-      return process?.isAlive == true
+      process?.isAlive == true
     } catch (_: Throwable) {
-      return false
+      false
     }
   }
 
@@ -63,4 +49,23 @@ object XrayProcessBridge {
   }
 
   fun isRunning(): Boolean = process?.isAlive == true
+
+  private fun resolveBinary(context: Context): File? {
+    val candidates = listOf(
+      File(context.filesDir, "xray/xray"),
+      File(context.cacheDir, "xray/xray"),
+      File(context.getExternalFilesDir(null), "xray/xray"),
+      File("/data/data/${context.packageName}/files/xray/xray")
+    )
+
+    for (candidate in candidates) {
+      if (candidate.exists() && candidate.canExecute()) return candidate
+      if (candidate.exists() && !candidate.canExecute()) {
+        candidate.setExecutable(true, false)
+        if (candidate.canExecute()) return candidate
+      }
+    }
+
+    return null
+  }
 }
