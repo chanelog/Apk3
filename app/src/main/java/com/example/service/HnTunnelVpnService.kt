@@ -117,6 +117,7 @@ class HnTunnelVpnService : VpnService() {
         }
         vpnInterface = pfd
         LogManager.s("Virtual interface tun0 established (MTU 1500).")
+        startTunActivityMonitor(pfd)
 
         // 2. Sambungkan backend sesuai jenis tunnel.
         TunnelController.updateState(TunnelState.HANDSHAKING)
@@ -155,6 +156,50 @@ class HnTunnelVpnService : VpnService() {
         LogManager.e("Tunnel connection failed: ${e.message}")
         TunnelController.updateState(TunnelState.DISCONNECTED)
         stopTunnel()
+      }
+    }
+  }
+
+  /**
+   * Diagnostik pasif: cek apakah OS Android BENAR-BENAR mengirim paket ke TUN
+   * interface kita atau tidak, tanpa mengambil/mengganggu data yang sudah ada
+   * (cuma poll(), tidak read()) — supaya tidak bentrok dengan backend asli
+   * (HevSocks5Bridge/Xray) yang juga baca dari fd yang sama.
+   */
+  private fun startTunActivityMonitor(pfd: ParcelFileDescriptor) {
+    serviceScope.launch(Dispatchers.IO) {
+      var totalHits = 0
+      var windowHits = 0
+      var seconds = 0
+      try {
+        val fd = pfd.fileDescriptor
+        while (isActive && vpnInterface != null) {
+          val pollfd = android.system.StructPollfd().apply {
+            this.fd = fd
+            this.events = android.system.OsConstants.POLLIN.toShort()
+          }
+          val n = try {
+            android.system.Os.poll(arrayOf(pollfd), 1000)
+          } catch (e: Exception) {
+            LogManager.d("DIAGNOSTIK: poll() TUN error: ${e.message}")
+            break
+          }
+          if (n > 0 && (pollfd.revents.toInt() and android.system.OsConstants.POLLIN) != 0) {
+            windowHits++
+            totalHits++
+          }
+          seconds++
+          if (seconds % 5 == 0) {
+            if (totalHits == 0) {
+              LogManager.e("DIAGNOSTIK: TUN belum menerima paket APAPUN dalam ${seconds}s. OS kemungkinan tidak merutekan trafik ke TUN kita.")
+            } else {
+              LogManager.d("DIAGNOSTIK: TUN aktif menerima paket (${windowHits}x dalam 5s terakhir, total ${totalHits}x).")
+            }
+            windowHits = 0
+          }
+        }
+      } catch (e: Exception) {
+        LogManager.d("DIAGNOSTIK: monitor TUN berhenti: ${e.message}")
       }
     }
   }
