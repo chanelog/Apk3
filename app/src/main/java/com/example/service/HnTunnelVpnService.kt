@@ -20,6 +20,7 @@ import com.example.model.TunnelType
 import com.example.tunnel.HevSocks5Bridge
 import com.example.tunnel.SshSocksBridge
 import com.example.tunnel.TunnelController
+import com.example.tunnel.XrayConfigBuilder
 import com.example.tunnel.XrayCoreBridge
 import com.example.util.LogManager
 import kotlinx.coroutines.CoroutineScope
@@ -95,7 +96,6 @@ class HnTunnelVpnService : VpnService() {
           }
           TunnelType.V2RAY_VMESS, TunnelType.V2RAY_VLESS, TunnelType.TROJAN -> connectXrayBackend(config, pfd.fd)
         }
-        // The SOCKS check applies to SSH/tun2socks. Xray owns the TUN directly.
         if (config.type == TunnelType.SSH_DIRECT || config.type == TunnelType.SSH_SSL_TLS || config.type == TunnelType.SSH_HTTP_PROXY) {
           if (!verifySocksConnectivity()) throw IllegalStateException("Backend hidup tetapi tidak dapat meneruskan koneksi HTTPS")
         }
